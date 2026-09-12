@@ -1,0 +1,8 @@
+name = "obsidian-assistant"
+main = "src/index.js"
+compatibility_date = "2026-09-12"
+
+[vars]
+ALLOWED_CHAT_ID = "8681617992"
+GITHUB_OWNER = ""
+GITHUB_REPO = ""
