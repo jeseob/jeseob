@@ -471,7 +471,9 @@ function shouldAskVault(text, image, audio, urls) {
   if ((urls || []).some(isYouTubeUrl)) return false;
   if (shouldRunResearch(text, image, audio, urls)) return false;
   if (extractHttpUrls(text).length) return false;
-  return /볼트|\?|뭐야|뭐 있어|요약해줘|관련.*뭐|어떻게 돼/.test(String(text || ''));
+  const t = String(text || '');
+  if (/정리해|저장해|올려줘|스크랩/.test(t) && !/[?？]/.test(t)) return false;
+  return /[?？]|뭐야|뭐 있어|뭐였|어디 있|언제|누구|왜 |기억|알려줘|어때|어떻게|관련|볼트/.test(t);
 }
 
 async function fetchRelevantNotes(env, query, noteIndex) {
