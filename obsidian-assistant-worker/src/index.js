@@ -46,7 +46,6 @@ const SAVE_SKILLS = new Set([
   'organize',
   'paper',
   'youtube',
-  'research',
   'capture'
 ]);
 
@@ -114,6 +113,11 @@ async function processAssistantTask(message, env) {
       return;
     }
 
+    if (isOutsourcedResearch(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
+      await notify(env, chatId, '조사는 워커에서 하지 않습니다.');
+      return;
+    }
+
     const youtubeUrl = linkedUrls.find(isYouTubeUrl);
     if (youtubeUrl) {
       const meta = await fetchYouTubeMeta(youtubeUrl);
@@ -128,22 +132,6 @@ async function processAssistantTask(message, env) {
       textContent = `${textContent}\n\n----- 가져온 원문 -----\n${pageTexts.join('\n\n')}`;
     } else if (pageUrls.length) {
       steps.push({ name: 'URL 수집', ok: false, detail: `열기 실패: ${pageUrls.join(', ')}` });
-    }
-
-    let researchHits = [];
-    if (shouldRunResearch(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
-      const research = await searchStrategySources(env, textContent);
-      researchHits = research.hits;
-      steps.push({
-        name: '자료 검색',
-        ok: !research.error || researchHits.length > 0,
-        detail: researchHits.length
-          ? `${researchHits.length}건`
-          : (research.error || '검색 결과 없음')
-      });
-      if (researchHits.length) {
-        textContent = `${textContent}\n\n----- 전략·컨설팅 자료 -----\n${researchHits.join('\n')}`;
-      }
     }
 
     const needCalendar = shouldLookupCalendar(textContent, inlineAudioData);
@@ -307,7 +295,7 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
 - capture는 이미지에 보이는 글자만 적는다. 카카오톡/문자 추정은 화면 단서로만.
 - youtube는 영상/메타에 있는 내용만. 없는 인용을 만들지 않는다.
 - paper는 연 초록/공개본만. 유료 본문을 추측하지 않는다.
-- research는 학술 논문보다 컨설팅 보고서, 논설, 전략 자료를 우선한다. 검색으로 찾은 출처만 쓰고 제목·URL을 만들지 않는다. 학술 논문 목록은 만들지 않는다.
+- 논문·컨설팅·전략 자료 조사는 하지 않는다. 파일을 만들지 말고 replyMessage로 "조사는 워커에서 하지 않습니다."만 답한다.
 - ask는 평소 질문이다. 볼트에 따로 묻지 않아도 된다. 파일을 저장하지 말고 replyMessage로만 답한다. 관련 노트 본문에 있는 사실만 쓰고 [[경로]]로 근거를 밝힌다. 본문에 없으면 "볼트에 없음".
 - chat는 인사·짧은 잡담·감탄·단순 응답(안녕, ㅇㅋ, 고마워, ㅋㅋ)이다. 파일을 만들지 말고 replyMessage로 한두 문장만 답한다. 사실·할 일·결정·링크·숫자가 있으면 chat이 아니다.
 - 노트 본문은 양식 섹션을 채워 마크다운으로 작성한다.
@@ -468,8 +456,7 @@ function guessSkillHint(ctx) {
   if (ctx.youtubeUrl || isYouTubeUrl(text)) return 'youtube';
   if (/일정\s*잡아|캘린더.*등록|미팅 잡아/.test(text)) return 'calendar.create';
   if (/결과 정리|일정 결과/.test(text)) return 'calendar.result';
-  if (/컨설팅|논설|벤치마크|전략 자료|전략 보고|AX 전략|자료 찾아|조사해|리서치|보고서 찾아/.test(text)) return 'research';
-  if (/arxiv\.org|doi\.org|10\.\d{4,}\/|논문/.test(text)) return 'paper';
+  if (/arxiv\.org|doi\.org|10\.\d{4,}\//.test(text)) return 'paper';
   if (/Inbox 정리|인박스 정리/.test(text)) return 'organize';
   if (isCasualChat(text, ctx.inlineImageData, ctx.inlineAudioData, extractHttpUrls(text))) return 'chat';
   if (shouldAskVault(text, ctx.inlineImageData, ctx.inlineAudioData, extractHttpUrls(text))) return 'ask';
@@ -482,7 +469,6 @@ function guessSkillHint(ctx) {
 function shouldAskVault(text, image, audio, urls) {
   if (image || audio) return false;
   if ((urls || []).some(isYouTubeUrl)) return false;
-  if (shouldRunResearch(text, image, audio, urls)) return false;
   if (extractHttpUrls(text).length) return false;
   const t = String(text || '');
   if (/정리해|저장해|올려줘|스크랩/.test(t) && !/[?？]/.test(t)) return false;
@@ -518,10 +504,10 @@ function tokenizeQuery(query) {
   return [...new Set(words)].filter((word) => !stop.has(word));
 }
 
-function shouldRunResearch(text, image, audio, urls) {
+function isOutsourcedResearch(text, image, audio, urls) {
   if (image || audio) return false;
-  if (urls.some(isYouTubeUrl)) return false;
-  return /컨설팅|논설|벤치마크|전략 자료|전략 보고|AX 전략|자료 찾아|조사해|리서치|보고서 찾아/.test(String(text || ''));
+  if ((urls || []).length) return false;
+  return /컨설팅|논설|벤치마크|전략 자료|전략 보고|AX 전략|자료 찾아|조사해|리서치|보고서 찾아|논문 찾아/.test(String(text || ''));
 }
 
 function isYouTubeUrl(value) {
@@ -542,60 +528,6 @@ async function fetchYouTubeMeta(url) {
   }
 }
 
-function cleanResearchQuery(query) {
-  return String(query || '')
-    .replace(/https?:\/\/\S+/g, ' ')
-    .replace(/컨설팅|논설|벤치마크|전략 자료|전략 보고|AX 전략|자료 찾아|조사해|리서치|보고서 찾아|찾아줘|기사 정리/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 300);
-}
-
-async function searchStrategySources(env, query) {
-  const topic = cleanResearchQuery(query) || String(query || '').trim();
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${env.GEMINI_API_KEY.trim()}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          role: 'user',
-          parts: [{
-            text: `Find recent consulting reports, strategy papers, and expert commentaries on:
-${topic}
-
-Prefer McKinsey, BCG, Bain, Deloitte, PwC, Accenture, Gartner, KISTEP, STEPI, and comparable firms.
-If the topic is R&D AX or enterprise AI transformation, prioritize those.
-Do not invent titles or URLs. Do not list academic journal papers.
-
-Return JSON only:
-{"items":[{"title":"","org":"","year":"","url":"","type":"consulting|report|commentary"}]}
-If none, {"items":[]}.`
-          }]
-        }],
-        tools: [{ googleSearch: {} }]
-      })
-    }
-  );
-  const data = await readJsonSafe(res);
-  if (!res.ok) return { hits: [], error: `자료 검색 HTTP ${res.status}` };
-
-  try {
-    const parsed = parseAiJson(extractGeminiText(data));
-    const items = Array.isArray(parsed.items) ? parsed.items : [];
-    return {
-      hits: items
-        .filter((item) => item?.title && item?.url)
-        .slice(0, 7)
-        .map((item) => `- [${item.type || 'report'}] ${item.title} / ${item.org || ''} / ${item.year || ''} / ${item.url}`),
-      error: ''
-    };
-  } catch (err) {
-    return { hits: [], error: `자료 검색 파싱: ${err.message}` };
-  }
-}
-
 function normalizeSkill(aiResult) {
   const raw = String(aiResult.skill || aiResult.action || 'memo').trim();
   const map = {
@@ -605,7 +537,8 @@ function normalizeSkill(aiResult) {
     chat: 'chat',
     smalltalk: 'chat',
     skip: 'chat',
-    ignore: 'chat'
+    ignore: 'chat',
+    research: 'ask'
   };
   return map[raw] || raw;
 }
@@ -866,11 +799,6 @@ function buildCompletionMessage(aiResult, results, steps, skill) {
 
   if (results.obsidian) {
     lines.push(`📝 옵시디언 저장 완료: ${results.obsidian.path}`);
-  }
-
-  const researchStep = steps.find((step) => step.name === '자료 검색');
-  if (researchStep) {
-    lines.push(`🔎 ${researchStep.detail}`);
   }
 
   if (skill === 'ask') {
