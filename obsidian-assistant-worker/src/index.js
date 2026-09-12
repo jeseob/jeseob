@@ -132,17 +132,17 @@ async function processAssistantTask(message, env) {
 
     let researchHits = [];
     if (shouldRunResearch(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
-      const research = await searchOpenAlex(env, textContent);
+      const research = await searchStrategySources(env, textContent);
       researchHits = research.hits;
       steps.push({
-        name: '논문 검색',
-        ok: true,
+        name: '자료 검색',
+        ok: !research.error || researchHits.length > 0,
         detail: researchHits.length
-          ? `${researchHits.length}건 · ${research.source} · ${research.query} · ${research.probe}`
-          : `검색 결과 없음 (${research.query || '질의 없음'}) · ${research.probe || research.error || ''}`
+          ? `${researchHits.length}건`
+          : (research.error || '검색 결과 없음')
       });
       if (researchHits.length) {
-        textContent = `${textContent}\n\n----- ${research.source} 검색 결과 -----\n검색어: ${research.query}\n${researchHits.join('\n')}`;
+        textContent = `${textContent}\n\n----- 전략·컨설팅 자료 -----\n${researchHits.join('\n')}`;
       }
     }
 
@@ -307,7 +307,7 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
 - capture는 이미지에 보이는 글자만 적는다. 카카오톡/문자 추정은 화면 단서로만.
 - youtube는 영상/메타에 있는 내용만. 없는 인용을 만들지 않는다.
 - paper는 연 초록/공개본만. 유료 본문을 추측하지 않는다.
-- research는 OpenAlex 검색 결과와 사용자가 준 링크만 출처로 쓴다. 없는 논문을 만들지 않는다.
+- research는 학술 논문보다 컨설팅 보고서, 논설, 전략 자료를 우선한다. 검색으로 찾은 출처만 쓰고 제목·URL을 만들지 않는다. 학술 논문 목록은 만들지 않는다.
 - ask는 평소 질문이다. 볼트에 따로 묻지 않아도 된다. 파일을 저장하지 말고 replyMessage로만 답한다. 관련 노트 본문에 있는 사실만 쓰고 [[경로]]로 근거를 밝힌다. 본문에 없으면 "볼트에 없음".
 - chat는 인사·짧은 잡담·감탄·단순 응답(안녕, ㅇㅋ, 고마워, ㅋㅋ)이다. 파일을 만들지 말고 replyMessage로 한두 문장만 답한다. 사실·할 일·결정·링크·숫자가 있으면 chat이 아니다.
 - 노트 본문은 양식 섹션을 채워 마크다운으로 작성한다.
@@ -468,7 +468,7 @@ function guessSkillHint(ctx) {
   if (ctx.youtubeUrl || isYouTubeUrl(text)) return 'youtube';
   if (/일정\s*잡아|캘린더.*등록|미팅 잡아/.test(text)) return 'calendar.create';
   if (/결과 정리|일정 결과/.test(text)) return 'calendar.result';
-  if (/논문 찾아|자료 찾아|조사해|리서치|찾아줘/.test(text)) return 'research';
+  if (/컨설팅|논설|벤치마크|전략 자료|전략 보고|AX 전략|자료 찾아|조사해|리서치|보고서 찾아/.test(text)) return 'research';
   if (/arxiv\.org|doi\.org|10\.\d{4,}\/|논문/.test(text)) return 'paper';
   if (/Inbox 정리|인박스 정리/.test(text)) return 'organize';
   if (isCasualChat(text, ctx.inlineImageData, ctx.inlineAudioData, extractHttpUrls(text))) return 'chat';
@@ -521,7 +521,7 @@ function tokenizeQuery(query) {
 function shouldRunResearch(text, image, audio, urls) {
   if (image || audio) return false;
   if (urls.some(isYouTubeUrl)) return false;
-  return /논문 찾아|자료 찾아|조사해|리서치|찾아줘/.test(String(text || ''));
+  return /컨설팅|논설|벤치마크|전략 자료|전략 보고|AX 전략|자료 찾아|조사해|리서치|보고서 찾아/.test(String(text || ''));
 }
 
 function isYouTubeUrl(value) {
@@ -545,37 +545,14 @@ async function fetchYouTubeMeta(url) {
 function cleanResearchQuery(query) {
   return String(query || '')
     .replace(/https?:\/\/\S+/g, ' ')
-    .replace(/논문 찾아|자료 찾아|조사해|리서치|찾아줘|기사 정리/g, ' ')
+    .replace(/컨설팅|논설|벤치마크|전략 자료|전략 보고|AX 전략|자료 찾아|조사해|리서치|보고서 찾아|찾아줘|기사 정리/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 200);
+    .slice(0, 300);
 }
 
-function sanitizeEnglishQuery(text) {
-  const cleaned = String(text || '')
-    .replace(/MYMEMORY WARNING:.*/i, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&quot;|&#39;|&amp;|["'`]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!cleaned || /[가-힣]/.test(cleaned)) return '';
-  return cleaned.slice(0, 200);
-}
-
-async function translateResearchQuery(query) {
-  if (!/[가-힣]/.test(query)) return query;
-
-  const url = new URL('https://api.mymemory.translated.net/get');
-  url.searchParams.set('q', query.slice(0, 500));
-  url.searchParams.set('langpair', 'ko|en');
-  const res = await fetch(url, { headers: { 'User-Agent': 'ObsidianAssistant/1.0' } });
-  const data = await readJsonSafe(res);
-  return sanitizeEnglishQuery(data?.responseData?.translatedText);
-}
-
-async function toEnglishResearchQuery(env, query) {
-  if (!/[가-힣]/.test(query)) return query;
-
+async function searchStrategySources(env, query) {
+  const topic = cleanResearchQuery(query) || String(query || '').trim();
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${env.GEMINI_API_KEY.trim()}`,
     {
@@ -585,139 +562,16 @@ async function toEnglishResearchQuery(env, query) {
         contents: [{
           role: 'user',
           parts: [{
-            text: `Convert this research topic into an English academic search query for OpenAlex. Use 6-12 words. No quotes, no explanation.\n\n${query}`
-          }]
-        }]
-      })
-    }
-  );
-  const data = await readJsonSafe(res);
-  if (!res.ok) return '';
+            text: `Find recent consulting reports, strategy papers, and expert commentaries on:
+${topic}
 
-  try {
-    return sanitizeEnglishQuery(extractGeminiText(data));
-  } catch {
-    return '';
-  }
-}
+Prefer McKinsey, BCG, Bain, Deloitte, PwC, Accenture, Gartner, KISTEP, STEPI, and comparable firms.
+If the topic is R&D AX or enterprise AI transformation, prioritize those.
+Do not invent titles or URLs. Do not list academic journal papers.
 
-function formatPaperHit(title, authors, year, id) {
-  return `- ${title || '(제목 없음)'} / ${authors || ''} / ${year || ''} / ${id || ''}`.replace(/ \/  \/ /g, ' / ');
-}
-
-function paperFetchHeaders() {
-  return {
-    Accept: 'application/json',
-    'User-Agent': 'ObsidianAssistant/1.0 (mailto:obsidian-assistant@users.noreply.github.com; https://github.com/jeseob/jeseob)'
-  };
-}
-
-async function fetchJson(url) {
-  const res = await fetch(url, { headers: paperFetchHeaders() });
-  const data = await readJsonSafe(res);
-  return { res, data };
-}
-
-function shortenEnglishQuery(query) {
-  const words = String(query || '').split(/\s+/).filter(Boolean);
-  if (words.length <= 6) return '';
-  return words.slice(0, 6).join(' ');
-}
-
-async function fetchOpenAlexWorks(query) {
-  const url = new URL('https://api.openalex.org/works');
-  url.searchParams.set('search', query);
-  url.searchParams.set('per-page', '5');
-
-  try {
-    const { res, data } = await fetchJson(url);
-    if (!res.ok) return { hits: [], status: res.status, error: `OpenAlex HTTP ${res.status}` };
-    if (!Array.isArray(data.results)) return { hits: [], status: res.status, error: 'OpenAlex 응답 형식 오류' };
-    return {
-      status: res.status,
-      hits: data.results.map((work) => {
-        const authors = (work.authorships || []).slice(0, 4).map((a) => a.author?.display_name).filter(Boolean).join(', ');
-        return formatPaperHit(
-          work.display_name,
-          authors,
-          work.publication_year || '',
-          work.doi || work.primary_location?.landing_page_url || work.id || ''
-        );
-      }),
-      error: ''
-    };
-  } catch (err) {
-    return { hits: [], status: 0, error: `OpenAlex 호출 실패: ${err.message}` };
-  }
-}
-
-async function fetchCrossrefWorks(query) {
-  const url = new URL('https://api.crossref.org/works');
-  url.searchParams.set('query', query);
-  url.searchParams.set('rows', '5');
-
-  try {
-    const { res, data } = await fetchJson(url);
-    const items = data?.message?.items;
-    if (!res.ok || !Array.isArray(items)) {
-      return { hits: [], status: res.status, error: `Crossref HTTP ${res.status}` };
-    }
-    return {
-      status: res.status,
-      hits: items.map((item) => {
-        const title = Array.isArray(item.title) ? item.title[0] : item.title;
-        const authors = (item.author || []).slice(0, 4).map((a) => [a.given, a.family].filter(Boolean).join(' ')).join(', ');
-        const year = item.issued?.['date-parts']?.[0]?.[0] || '';
-        const doi = item.DOI ? `https://doi.org/${item.DOI}` : '';
-        return formatPaperHit(title, authors, year, doi);
-      }),
-      error: ''
-    };
-  } catch (err) {
-    return { hits: [], status: 0, error: `Crossref 호출 실패: ${err.message}` };
-  }
-}
-
-async function fetchEuropePmcWorks(query) {
-  const url = new URL('https://www.ebi.ac.uk/europepmc/webservices/rest/search');
-  url.searchParams.set('query', query);
-  url.searchParams.set('format', 'json');
-  url.searchParams.set('pageSize', '5');
-
-  try {
-    const { res, data } = await fetchJson(url);
-    const items = data?.resultList?.result;
-    if (!res.ok || !Array.isArray(items)) {
-      return { hits: [], status: res.status, error: `EuropePMC HTTP ${res.status}` };
-    }
-    return {
-      status: res.status,
-      hits: items.map((item) => formatPaperHit(
-        item.title,
-        item.authorString || '',
-        item.pubYear || '',
-        item.doi ? `https://doi.org/${item.doi}` : (item.fullTextUrlList?.fullTextUrl?.[0]?.url || '')
-      )),
-      error: ''
-    };
-  } catch (err) {
-    return { hits: [], status: 0, error: `EuropePMC 호출 실패: ${err.message}` };
-  }
-}
-
-async function searchPapersWithGemini(env, query) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${env.GEMINI_API_KEY.trim()}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          role: 'user',
-          parts: [{
-            text: `Find 5 real published academic papers on: ${query}
-Return JSON only: {"papers":[{"title":"","authors":"","year":"","doi":""}]}
-Use only papers found via search. Do not invent titles or DOIs. If none, {"papers":[]}.`
+Return JSON only:
+{"items":[{"title":"","org":"","year":"","url":"","type":"consulting|report|commentary"}]}
+If none, {"items":[]}.`
           }]
         }],
         tools: [{ googleSearch: {} }]
@@ -725,88 +579,21 @@ Use only papers found via search. Do not invent titles or DOIs. If none, {"paper
     }
   );
   const data = await readJsonSafe(res);
-  if (!res.ok) return { hits: [], status: res.status, error: `Gemini 검색 HTTP ${res.status}` };
+  if (!res.ok) return { hits: [], error: `자료 검색 HTTP ${res.status}` };
 
   try {
     const parsed = parseAiJson(extractGeminiText(data));
-    const papers = Array.isArray(parsed.papers) ? parsed.papers : [];
+    const items = Array.isArray(parsed.items) ? parsed.items : [];
     return {
-      status: res.status,
-      hits: papers
-        .filter((paper) => paper?.title)
-        .slice(0, 5)
-        .map((paper) => formatPaperHit(
-          paper.title,
-          paper.authors || '',
-          paper.year || '',
-          paper.doi ? (String(paper.doi).startsWith('http') ? paper.doi : `https://doi.org/${paper.doi}`) : ''
-        )),
+      hits: items
+        .filter((item) => item?.title && item?.url)
+        .slice(0, 7)
+        .map((item) => `- [${item.type || 'report'}] ${item.title} / ${item.org || ''} / ${item.year || ''} / ${item.url}`),
       error: ''
     };
   } catch (err) {
-    return { hits: [], status: res.status, error: `Gemini 검색 파싱: ${err.message}` };
+    return { hits: [], error: `자료 검색 파싱: ${err.message}` };
   }
-}
-
-async function buildEnglishResearchQueries(env, cleaned) {
-  const searches = [];
-  try {
-    const translated = await translateResearchQuery(cleaned);
-    if (translated) searches.push(translated);
-  } catch {
-    // Gemini 변환으로 진행
-  }
-  try {
-    const english = await toEnglishResearchQuery(env, cleaned);
-    if (english && !searches.includes(english)) searches.push(english);
-  } catch {
-    // 번역 검색어로 진행
-  }
-  if (!/[가-힣]/.test(cleaned) && !searches.includes(cleaned)) searches.push(cleaned);
-  for (const search of [...searches]) {
-    const shorter = shortenEnglishQuery(search);
-    if (shorter && !searches.includes(shorter)) searches.push(shorter);
-  }
-  return searches;
-}
-
-async function searchOpenAlex(env, query) {
-  const cleaned = cleanResearchQuery(query);
-  if (!cleaned) return { hits: [], query: '', source: '', error: '', probe: '' };
-
-  const searches = await buildEnglishResearchQueries(env, cleaned);
-  if (!searches.length) return { hits: [], query: cleaned, source: '', error: '영문 검색어 없음', probe: '' };
-
-  const probes = [];
-  const sources = [
-    ['OA', fetchOpenAlexWorks],
-    ['CR', fetchCrossrefWorks],
-    ['EP', fetchEuropePmcWorks]
-  ];
-
-  for (const search of searches) {
-    for (const [label, fetchWorks] of sources) {
-      const result = await fetchWorks(search);
-      probes.push(`${label}=${result.status}/${result.hits.length}`);
-      if (result.hits.length) {
-        return {
-          hits: result.hits,
-          query: search,
-          source: label,
-          error: '',
-          probe: probes.join(' ')
-        };
-      }
-    }
-  }
-
-  const gemini = await searchPapersWithGemini(env, searches[0]);
-  probes.push(`G=${gemini.status}/${gemini.hits.length}`);
-  if (gemini.hits.length) {
-    return { hits: gemini.hits, query: searches[0], source: 'Gemini', error: '', probe: probes.join(' ') };
-  }
-
-  return { hits: [], query: searches[0], source: '', error: gemini.error || '', probe: probes.join(' ') };
 }
 
 function normalizeSkill(aiResult) {
@@ -1081,7 +868,7 @@ function buildCompletionMessage(aiResult, results, steps, skill) {
     lines.push(`📝 옵시디언 저장 완료: ${results.obsidian.path}`);
   }
 
-  const researchStep = steps.find((step) => step.name === '논문 검색');
+  const researchStep = steps.find((step) => step.name === '자료 검색');
   if (researchStep) {
     lines.push(`🔎 ${researchStep.detail}`);
   }
