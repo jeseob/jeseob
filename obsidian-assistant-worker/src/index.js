@@ -148,6 +148,12 @@ async function processAssistantTask(message, env) {
     ]);
     steps.push({ name: '스킬 로드', ok: true, detail: skillsDoc ? SKILL_PATH : '없음(기본 규칙)' });
     steps.push({ name: '볼트 목록', ok: true, detail: `${noteIndex.length}개 노트` });
+
+    let noteBodies = [];
+    if (shouldAskVault(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
+      noteBodies = await fetchRelevantNotes(env, textContent, noteIndex);
+      steps.push({ name: '관련 노트 읽기', ok: true, detail: `${noteBodies.length}개` });
+    }
     if (needCalendar) {
       if (calendarEvents.error) {
         steps.push({ name: '캘린더 조회', ok: false, detail: calendarEvents.error });
@@ -163,6 +169,7 @@ async function processAssistantTask(message, env) {
       youtubeUrl,
       skillsDoc,
       noteIndex,
+      noteBodies,
       calendarEvents: calendarEvents.items || [],
       calendarError: calendarEvents.error || ''
     });
@@ -272,6 +279,9 @@ ${templateDoc || '(양식 없음. 양식 섹션을 스스로 구성)'}
 기존 노트 목록(이 제목만 [[위키링크]] 가능):
 ${ctx.noteIndex.slice(0, 200).map((n) => `- ${n}`).join('\n') || '- (없음)'}
 
+관련 노트 본문(ask는 여기 있는 내용만 사용):
+${(ctx.noteBodies || []).join('\n\n') || '(해당 본문 없음)'}
+
 캘린더 일정(조회 결과):
 ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForPrompt(ctx.calendarEvents)}
 
@@ -287,7 +297,7 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
 - youtube는 영상/메타에 있는 내용만. 없는 인용을 만들지 않는다.
 - paper는 연 초록/공개본만. 유료 본문을 추측하지 않는다.
 - research는 OpenAlex 검색 결과와 사용자가 준 링크만 출처로 쓴다. 없는 논문을 만들지 않는다.
-- ask는 obsidianNote를 넣지 말고 replyMessage로만 답한다. 볼트에 없으면 "볼트에 없음".
+- ask는 obsidianNote를 넣지 말고 replyMessage로만 답한다. 관련 노트 본문에 있는 사실만 쓰고 [[경로]]로 근거를 밝힌다. 본문에 없으면 "볼트에 없음".
 - 노트 본문은 양식 섹션을 채워 마크다운으로 작성한다.
 
 반드시 JSON만 응답:
@@ -449,11 +459,48 @@ function guessSkillHint(ctx) {
   if (/논문 찾아|자료 찾아|조사해|리서치|찾아줘/.test(text)) return 'research';
   if (/arxiv\.org|doi\.org|10\.\d{4,}\/|논문/.test(text)) return 'paper';
   if (/Inbox 정리|인박스 정리/.test(text)) return 'organize';
-  if (/\?|뭐야|관련.*뭐/.test(text) && !ctx.inlineAudioData) return 'ask';
+  if (shouldAskVault(text, ctx.inlineImageData, ctx.inlineAudioData, extractHttpUrls(text))) return 'ask';
   if (/기사|뉴스|https?:\/\//.test(text)) return 'article';
   if (/전화|통화/.test(text)) return 'call';
   if (/회의|미팅/.test(text) || ctx.inlineAudioData) return '';
   return 'memo';
+}
+
+function shouldAskVault(text, image, audio, urls) {
+  if (image || audio) return false;
+  if ((urls || []).some(isYouTubeUrl)) return false;
+  if (shouldRunResearch(text, image, audio, urls)) return false;
+  if (extractHttpUrls(text).length) return false;
+  return /볼트|\?|뭐야|뭐 있어|요약해줘|관련.*뭐|어떻게 돼/.test(String(text || ''));
+}
+
+async function fetchRelevantNotes(env, query, noteIndex) {
+  const terms = tokenizeQuery(query);
+  const ranked = noteIndex
+    .map((path) => {
+      const hay = path.toLowerCase();
+      const score = terms.reduce((sum, term) => sum + (hay.includes(term) ? 1 : 0), 0);
+      return { path, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const picked = (ranked.length ? ranked : noteIndex.filter((path) => path.startsWith('Inbox/')).slice(-5))
+    .slice(0, 5)
+    .map((item) => item.path || item);
+
+  const bodies = [];
+  for (const path of picked) {
+    const content = await readVaultFile(env, `${path}.md`);
+    if (content) bodies.push(`### ${path}\n${content.slice(0, 3500)}`);
+  }
+  return bodies;
+}
+
+function tokenizeQuery(query) {
+  const words = String(query || '').toLowerCase().match(/[a-z0-9]{3,}|[가-힣]{2,}/g) || [];
+  const stop = new Set(['정리', '관련', '뭐야', '찾아', '기사', '볼트', '노트', '내용', '요약', '해줘', '어떻게']);
+  return [...new Set(words)].filter((word) => !stop.has(word));
 }
 
 function shouldRunResearch(text, image, audio, urls) {
