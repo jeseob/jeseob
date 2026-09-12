@@ -24,17 +24,16 @@ const TEMPLATE_BY_SKILL = {
   capture: 'Templates/capture.md'
 };
 const FOLDER_BY_SKILL = {
-  call: 'Calls',
-  meeting: 'Meetings',
-  article: 'Inbox',
   memo: 'Inbox',
-  'calendar.create': 'Calendar',
-  'calendar.result': 'Calendar',
   organize: 'Inbox',
+  article: 'Clippings',
   paper: 'Papers',
   youtube: 'Videos',
-  research: 'Research',
-  capture: 'Captures'
+  capture: 'Captures',
+  'calendar.create': 'Calendar',
+  'calendar.result': 'Calendar',
+  meeting: 'Meetings',
+  call: 'Calls'
 };
 const SAVE_SKILLS = new Set([
   'call',
@@ -299,6 +298,7 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
 - ask는 평소 질문이다. 볼트에 따로 묻지 않아도 된다. 파일을 저장하지 말고 replyMessage로만 답한다. 관련 노트 본문에 있는 사실만 쓰고 [[경로]]로 근거를 밝힌다. 본문에 없으면 "볼트에 없음".
 - chat는 인사·짧은 잡담·감탄·단순 응답(안녕, ㅇㅋ, 고마워, ㅋㅋ)이다. 파일을 만들지 말고 replyMessage로 한두 문장만 답한다. 사실·할 일·결정·링크·숫자가 있으면 chat이 아니다.
 - 노트 본문은 양식 섹션을 채워 마크다운으로 작성한다.
+- 폴더는 스킬 기본값을 따른다. 메모만 Inbox, 기사·보고서는 Clippings, 논문은 Papers, 유튜브는 Videos, 스크린샷은 Captures, 일정은 Calendar, 회의는 Meetings, 전화는 Calls. Research에 쓰지 않는다.
 
 반드시 JSON만 응답:
 {
@@ -311,7 +311,7 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
   },
   "obsidianNote": {
     "title": "노트 파일명 (간결하게, 확장자 없음)",
-    "folder": "Inbox | Calls | Meetings | Calendar | Papers | Videos | Research | Captures",
+    "folder": "Inbox | Clippings | Papers | Videos | Captures | Calendar | Meetings | Calls",
     "content": "양식을 채운 마크다운"
   },
   "replyMessage": "사용자에게 보낼 짧은 안내"
@@ -486,7 +486,7 @@ async function fetchRelevantNotes(env, query, noteIndex) {
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score);
 
-  const picked = (ranked.length ? ranked : noteIndex.filter((path) => path.startsWith('Inbox/')).slice(-5))
+  const picked = (ranked.length ? ranked : noteIndex.filter((path) => /^(Inbox|Clippings|Papers)\//.test(path)).slice(-5))
     .slice(0, 5)
     .map((item) => item.path || item);
 
@@ -578,7 +578,7 @@ function casualReply(text) {
 function applySkillDefaults(skill, note) {
   return {
     title: note.title,
-    folder: note.folder || FOLDER_BY_SKILL[skill] || 'Inbox',
+    folder: FOLDER_BY_SKILL[skill] || note.folder || 'Inbox',
     content: note.content || ''
   };
 }
