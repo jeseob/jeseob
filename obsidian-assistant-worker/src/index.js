@@ -84,17 +84,30 @@ async function processAssistantTask(message, env) {
       return;
     }
 
+    const pageTexts = await fetchLinkedPages(textContent);
+    if (pageTexts.length) {
+      steps.push({ name: '기사 URL 수집', ok: true, detail: `${pageTexts.length}건` });
+      textContent = `${textContent}\n\n----- 가져온 원문 -----\n${pageTexts.join('\n\n')}`;
+    } else if (extractHttpUrls(textContent).length) {
+      steps.push({ name: '기사 URL 수집', ok: false, detail: 'URL은 있으나 본문을 열지 못함' });
+    }
+
+    const needCalendar = shouldLookupCalendar(textContent, inlineAudioData);
     const [skillsDoc, noteIndex, calendarEvents] = await Promise.all([
       readVaultFile(env, SKILL_PATH),
       listVaultNoteIndex(env),
-      listUpcomingCalendarEvents(env).catch((err) => ({ error: err.message, items: [] }))
+      needCalendar
+        ? listUpcomingCalendarEvents(env).catch((err) => ({ error: err.message, items: [] }))
+        : Promise.resolve({ items: [], skipped: true })
     ]);
     steps.push({ name: '스킬 로드', ok: true, detail: skillsDoc ? SKILL_PATH : '없음(기본 규칙)' });
     steps.push({ name: '볼트 목록', ok: true, detail: `${noteIndex.length}개 노트` });
-    if (calendarEvents.error) {
-      steps.push({ name: '캘린더 조회', ok: false, detail: calendarEvents.error });
-    } else {
-      steps.push({ name: '캘린더 조회', ok: true, detail: `${calendarEvents.items.length}건` });
+    if (needCalendar) {
+      if (calendarEvents.error) {
+        steps.push({ name: '캘린더 조회', ok: false, detail: calendarEvents.error });
+      } else {
+        steps.push({ name: '캘린더 조회', ok: true, detail: `${calendarEvents.items.length}건` });
+      }
     }
 
     const aiResult = await analyzeWithGemini(env, {
@@ -200,7 +213,9 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
 
 규칙:
 - 음성은 call(전화) 또는 meeting(회의) 중 하나로만 분류한다. 불확실하면 meeting으로 두지 말고 call로 두고 [확인 필요]를 표시한다.
-- article은 입력 하나만 요약하지 말고, 기존 노트 목록에서 관련 제목을 찾아 [[링크]]한다. 없으면 "관련 기존 노트 없음".
+- article은 가져온 원문을 근거로 정리한다. 원문이 없으면 출처에 "입력에 출처 없음" 또는 "원문을 열지 못함"을 쓰고 URL을 지어내지 않는다.
+- article은 기존 노트 목록에서 관련 제목을 찾아 [[링크]]한다. 없으면 "관련 기존 노트 없음".
+- 예시용 가짜 URL(예: 여기에-실제-기사주소)은 출처로 쓰지 않는다.
 - meeting은 캘린더와 시간/제목을 맞춘다. 맞으면 calendarMatch=matched, 없으면 unmatched.
 - [[링크]]는 위 목록에 있는 제목만. 없는 노트를 만들지 않는다.
 - 입력·볼트·캘린더에 없는 사실/숫자/인용/피드백/결정을 만들지 않는다. 불확실하면 [확인 필요].
@@ -263,6 +278,58 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
   } catch (err) {
     throw taggedError('Gemini JSON 파싱', err.message);
   }
+}
+
+function shouldLookupCalendar(textContent, inlineAudioData) {
+  const text = String(textContent || '');
+  if (inlineAudioData) return true;
+  return /회의|미팅|일정|캘린더|결과 정리/.test(text);
+}
+
+function extractHttpUrls(text) {
+  const matches = String(text || '').match(/https?:\/\/[^\s<>"']+/gi) || [];
+  return [...new Set(matches)]
+    .map((url) => url.replace(/[),.;]+$/, ''))
+    .filter((url) => !/여기에-실제|example\.com|localhost/.test(url));
+}
+
+async function fetchLinkedPages(text) {
+  const urls = extractHttpUrls(text).slice(0, 3);
+  const pages = [];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 ObsidianAssistant/1.0' },
+        redirect: 'follow'
+      });
+      if (!res.ok) {
+        pages.push(`URL: ${url}\n열기 실패: HTTP ${res.status}`);
+        continue;
+      }
+      const html = await res.text();
+      pages.push(`URL: ${url}\n${htmlToText(html)}`);
+    } catch (err) {
+      pages.push(`URL: ${url}\n열기 실패: ${err.message}`);
+    }
+  }
+  return pages;
+}
+
+function htmlToText(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 12000);
 }
 
 function guessSkillHint(textContent, inlineAudioData) {
