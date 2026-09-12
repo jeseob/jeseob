@@ -132,14 +132,17 @@ async function processAssistantTask(message, env) {
 
     let researchHits = [];
     if (shouldRunResearch(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
-      researchHits = await searchOpenAlex(textContent);
+      const research = await searchOpenAlex(env, textContent);
+      researchHits = research.hits;
       steps.push({
         name: '논문 검색',
         ok: true,
-        detail: researchHits.length ? `${researchHits.length}건` : '검색 결과 없음'
+        detail: researchHits.length
+          ? `${researchHits.length}건 (${research.query})`
+          : `검색 결과 없음 (${research.query || '질의 없음'})`
       });
       if (researchHits.length) {
-        textContent = `${textContent}\n\n----- OpenAlex 검색 결과 -----\n${researchHits.join('\n')}`;
+        textContent = `${textContent}\n\n----- OpenAlex 검색 결과 -----\n검색어: ${research.query}\n${researchHits.join('\n')}`;
       }
     }
 
@@ -539,16 +542,49 @@ async function fetchYouTubeMeta(url) {
   }
 }
 
-async function searchOpenAlex(query) {
-  const cleaned = String(query || '')
+function cleanResearchQuery(query) {
+  return String(query || '')
     .replace(/https?:\/\/\S+/g, ' ')
     .replace(/논문 찾아|자료 찾아|조사해|리서치|찾아줘|기사 정리/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 200);
-  if (!cleaned) return [];
+}
 
+async function toEnglishResearchQuery(env, query) {
+  if (!/[가-힣]/.test(query)) return query;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${env.GEMINI_API_KEY.trim()}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          role: 'user',
+          parts: [{
+            text: `Convert this research topic into an English academic search query for OpenAlex. Use 6-12 words. No quotes, no explanation.\n\n${query}`
+          }]
+        }],
+        generationConfig: { maxOutputTokens: 64 }
+      })
+    }
+  );
+  const data = await readJsonSafe(res);
+  if (!res.ok) return '';
+
+  try {
+    const text = extractGeminiText(data).replace(/["'`]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!text || /[가-힣]/.test(text)) return '';
+    return text.slice(0, 200);
+  } catch {
+    return '';
+  }
+}
+
+async function fetchOpenAlexWorks(query) {
   const url = new URL('https://api.openalex.org/works');
-  url.searchParams.set('search', cleaned);
+  url.searchParams.set('search', query);
   url.searchParams.set('per-page', '5');
   url.searchParams.set('sort', 'relevance_score:desc');
 
@@ -563,6 +599,26 @@ async function searchOpenAlex(query) {
     const landing = work.primary_location?.landing_page_url || work.id || '';
     return `- ${work.display_name || '(제목 없음)'} / ${authors} / ${year} / ${doi || landing}`;
   });
+}
+
+async function searchOpenAlex(env, query) {
+  const cleaned = cleanResearchQuery(query);
+  if (!cleaned) return { hits: [], query: '' };
+
+  const searches = [cleaned];
+  try {
+    const english = await toEnglishResearchQuery(env, cleaned);
+    if (english && english !== cleaned) searches.unshift(english);
+  } catch {
+    // 한글 질의 변환 실패 시 원문으로 검색
+  }
+
+  for (const search of searches) {
+    const hits = await fetchOpenAlexWorks(search);
+    if (hits.length) return { hits, query: search };
+  }
+
+  return { hits: [], query: searches[0] };
 }
 
 function normalizeSkill(aiResult) {
