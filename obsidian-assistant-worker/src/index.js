@@ -1,18 +1,42 @@
 /**
  * Telegram → Gemini → Google Calendar / GitHub(Obsidian) Cloudflare Worker
  *
- * Secrets (wrangler secret put):
- *   TELEGRAM_BOT_TOKEN, GEMINI_API_KEY,
- *   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN,
- *   GITHUB_TOKEN
- *
- * Vars:
- *   ALLOWED_CHAT_ID, GITHUB_OWNER, GITHUB_REPO
+ * 규칙 파일(볼트):
+ *   _system/skills.md
+ *   Templates/{article,meeting,call,inbox-memo,calendar-event,calendar-result}.md
  */
 
 const GEMINI_MODEL = 'gemini-3.6-flash';
 const TELEGRAM_MAX_CHARS = 3900;
 const FALLBACK_CHAT_ID = '8681617992';
+const SKILL_PATH = '_system/skills.md';
+const TEMPLATE_BY_SKILL = {
+  call: 'Templates/call.md',
+  meeting: 'Templates/meeting.md',
+  article: 'Templates/article.md',
+  memo: 'Templates/inbox-memo.md',
+  'calendar.create': 'Templates/calendar-event.md',
+  'calendar.result': 'Templates/calendar-result.md',
+  organize: 'Templates/inbox-memo.md'
+};
+const FOLDER_BY_SKILL = {
+  call: 'Calls',
+  meeting: 'Meetings',
+  article: 'Inbox',
+  memo: 'Inbox',
+  'calendar.create': 'Calendar',
+  'calendar.result': 'Calendar',
+  organize: 'Inbox'
+};
+const SAVE_SKILLS = new Set([
+  'call',
+  'meeting',
+  'article',
+  'memo',
+  'calendar.create',
+  'calendar.result',
+  'organize'
+]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -47,10 +71,10 @@ async function processAssistantTask(message, env) {
   const steps = [];
 
   try {
-    requireEnv(env, ['TELEGRAM_BOT_TOKEN', 'GEMINI_API_KEY']);
+    requireEnv(env, ['TELEGRAM_BOT_TOKEN', 'GEMINI_API_KEY', 'GITHUB_OWNER', 'GITHUB_REPO', 'GITHUB_TOKEN']);
 
     if (message.voice || message.audio) {
-      await notify(env, chatId, '🎙️ 음성을 수신했습니다. 분석 중입니다...');
+      await notify(env, chatId, '🎙️ 음성을 수신했습니다. 전화/회의를 구분해 정리합니다...');
       inlineAudioData = await downloadTelegramAudio(env, message.voice || message.audio);
       steps.push({ name: '음성 수신', ok: true, detail: inlineAudioData.mimeType });
     }
@@ -60,15 +84,33 @@ async function processAssistantTask(message, env) {
       return;
     }
 
-    const aiResult = await analyzeWithGemini(env, textContent, inlineAudioData);
-    steps.push({ name: 'Gemini 분석', ok: true, detail: `action=${aiResult.action || 'unknown'}` });
+    const [skillsDoc, noteIndex, calendarEvents] = await Promise.all([
+      readVaultFile(env, SKILL_PATH),
+      listVaultNoteIndex(env),
+      listUpcomingCalendarEvents(env).catch((err) => ({ error: err.message, items: [] }))
+    ]);
+    steps.push({ name: '스킬 로드', ok: true, detail: skillsDoc ? SKILL_PATH : '없음(기본 규칙)' });
+    steps.push({ name: '볼트 목록', ok: true, detail: `${noteIndex.length}개 노트` });
+    if (calendarEvents.error) {
+      steps.push({ name: '캘린더 조회', ok: false, detail: calendarEvents.error });
+    } else {
+      steps.push({ name: '캘린더 조회', ok: true, detail: `${calendarEvents.items.length}건` });
+    }
 
-    const results = {
-      calendar: null,
-      obsidian: null
-    };
+    const aiResult = await analyzeWithGemini(env, {
+      textContent,
+      inlineAudioData,
+      skillsDoc,
+      noteIndex,
+      calendarEvents: calendarEvents.items || [],
+      calendarError: calendarEvents.error || ''
+    });
+    const skill = normalizeSkill(aiResult);
+    steps.push({ name: 'Gemini 분석', ok: true, detail: `skill=${skill}` });
 
-    if ((aiResult.action === 'calendar' || aiResult.action === 'both') && aiResult.calendarEvent) {
+    const results = { calendar: null, obsidian: null };
+
+    if (skill === 'calendar.create' && aiResult.calendarEvent) {
       try {
         results.calendar = await createCalendarEvent(env, aiResult.calendarEvent);
         steps.push({ name: '구글 캘린더', ok: true, detail: results.calendar.summary });
@@ -77,16 +119,17 @@ async function processAssistantTask(message, env) {
       }
     }
 
-    if ((aiResult.action === 'obsidian' || aiResult.action === 'both') && aiResult.obsidianNote) {
+    if (SAVE_SKILLS.has(skill) && aiResult.obsidianNote) {
       try {
-        results.obsidian = await commitObsidianNote(env, aiResult.obsidianNote);
+        const note = applySkillDefaults(skill, aiResult.obsidianNote);
+        results.obsidian = await commitObsidianNote(env, note);
         steps.push({ name: '옵시디언 저장', ok: true, detail: results.obsidian.path });
       } catch (err) {
         steps.push({ name: '옵시디언 저장', ok: false, detail: err.message });
       }
     }
 
-    await notify(env, chatId, buildCompletionMessage(aiResult, results, steps));
+    await notify(env, chatId, buildCompletionMessage(aiResult, results, steps, skill));
   } catch (err) {
     await notify(env, chatId, buildErrorMessage(err, steps));
   }
@@ -127,32 +170,73 @@ async function downloadTelegramAudio(env, targetAudio) {
   };
 }
 
-async function analyzeWithGemini(env, textContent, inlineAudioData) {
+async function analyzeWithGemini(env, ctx) {
+  const skill = guessSkillHint(ctx.textContent, ctx.inlineAudioData);
+  const templatePaths = skill
+    ? [TEMPLATE_BY_SKILL[skill] || TEMPLATE_BY_SKILL.memo]
+    : [TEMPLATE_BY_SKILL.call, TEMPLATE_BY_SKILL.meeting];
+  const templateDocs = await Promise.all(templatePaths.map((path) => readVaultFile(env, path)));
+  const templateDoc = templatePaths
+    .map((path, idx) => `----- 양식 (${path}) -----\n${templateDocs[idx] || '(없음)'}`)
+    .join('\n\n');
+
   const systemPrompt = `당신은 사용자의 전담 개인 비서이자 지식 관리자입니다.
 현재 한국 시간(KST): ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}
 
-사용자 입력을 심층 분석하여 반드시 아래 JSON 규격으로만 응답하세요:
+아래 스킬 문서를 따른다. 스킬에 없는 일은 하지 않는다.
+----- 스킬 -----
+${ctx.skillsDoc || '(스킬 파일 없음. memo/meeting/article/ask만 사용)'}
+----- 스킬 끝 -----
+
+해당 스킬 양식:
+${templateDoc || '(양식 없음. 양식 섹션을 스스로 구성)'}
+----- 양식 끝 -----
+
+기존 노트 목록(이 제목만 [[위키링크]] 가능):
+${ctx.noteIndex.slice(0, 200).map((n) => `- ${n}`).join('\n') || '- (없음)'}
+
+캘린더 일정(조회 결과):
+${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForPrompt(ctx.calendarEvents)}
+
+규칙:
+- 음성은 call(전화) 또는 meeting(회의) 중 하나로만 분류한다. 불확실하면 meeting으로 두지 말고 call로 두고 [확인 필요]를 표시한다.
+- article은 입력 하나만 요약하지 말고, 기존 노트 목록에서 관련 제목을 찾아 [[링크]]한다. 없으면 "관련 기존 노트 없음".
+- meeting은 캘린더와 시간/제목을 맞춘다. 맞으면 calendarMatch=matched, 없으면 unmatched.
+- [[링크]]는 위 목록에 있는 제목만. 없는 노트를 만들지 않는다.
+- 입력·볼트·캘린더에 없는 사실/숫자/인용/피드백/결정을 만들지 않는다. 불확실하면 [확인 필요].
+- ask는 obsidianNote를 넣지 말고 replyMessage로만 답한다. 볼트에 없으면 "볼트에 없음".
+- 노트 본문은 양식 섹션을 채워 마크다운으로 작성한다.
+
+반드시 JSON만 응답:
 {
-  "action": "calendar" | "obsidian" | "both" | "chat",
+  "skill": "call" | "meeting" | "article" | "memo" | "ask" | "calendar.create" | "calendar.result" | "organize",
+  "calendarMatch": "matched" | "unmatched" | "not_applicable",
   "calendarEvent": {
     "summary": "일정 명칭",
-    "startTime": "ISO 8601 포맷 (예: 2026-09-13T15:00:00+09:00)",
-    "endTime": "ISO 8601 포맷"
+    "startTime": "ISO 8601",
+    "endTime": "ISO 8601"
   },
   "obsidianNote": {
-    "title": "노트 파일명 (간결하게)",
-    "folder": "Inbox",
-    "content": "심층 정리 마크다운 본문. 개요, 안건, 결정사항, Action Items 섹션 포함."
+    "title": "노트 파일명 (간결하게, 확장자 없음)",
+    "folder": "Inbox | Calls | Meetings | Calendar",
+    "content": "양식을 채운 마크다운"
   },
-  "replyMessage": "사용자에게 전송할 간결한 안내 문구"
+  "replyMessage": "사용자에게 보낼 짧은 안내"
 }`;
+
+  const userText = [
+    ctx.textContent || (ctx.inlineAudioData
+      ? '이 음성이 전화인지 회의인지 구분해 해당 스킬과 양식으로 정리해 줘.'
+      : ''),
+    skill ? `\n힌트 스킬: ${skill}` : ''
+  ].join('');
 
   const geminiPayload = {
     contents: [{
       role: 'user',
       parts: [
-        ...(inlineAudioData ? [{ inlineData: inlineAudioData }] : []),
-        { text: textContent || '회의 음성을 상세 분석하고 구조화된 회의록을 작성해 줘.' }
+        ...(ctx.inlineAudioData ? [{ inlineData: ctx.inlineAudioData }] : []),
+        { text: userText }
       ]
     }],
     systemInstruction: { parts: [{ text: systemPrompt }] },
@@ -181,9 +265,81 @@ async function analyzeWithGemini(env, textContent, inlineAudioData) {
   }
 }
 
-async function createCalendarEvent(env, calendarEvent) {
-  requireEnv(env, ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN']);
+function guessSkillHint(textContent, inlineAudioData) {
+  const text = String(textContent || '');
+  if (/일정\s*잡아|캘린더.*등록|미팅 잡아/.test(text)) return 'calendar.create';
+  if (/결과 정리|일정 결과/.test(text)) return 'calendar.result';
+  if (/\?|뭐야|요약해|관련.*뭐|찾아/.test(text) && !inlineAudioData) return 'ask';
+  if (/Inbox 정리|인박스 정리/.test(text)) return 'organize';
+  if (/기사|뉴스|http/.test(text)) return 'article';
+  if (/전화|통화/.test(text)) return 'call';
+  if (/회의|미팅/.test(text) || inlineAudioData) return '';
+  return 'memo';
+}
 
+function normalizeSkill(aiResult) {
+  const raw = String(aiResult.skill || aiResult.action || 'memo').trim();
+  const map = {
+    calendar: 'calendar.create',
+    both: 'calendar.create',
+    obsidian: 'memo',
+    chat: 'ask'
+  };
+  return map[raw] || raw;
+}
+
+function applySkillDefaults(skill, note) {
+  return {
+    title: note.title,
+    folder: note.folder || FOLDER_BY_SKILL[skill] || 'Inbox',
+    content: note.content || ''
+  };
+}
+
+async function githubHeaders(env) {
+  return {
+    Authorization: `Bearer ${env.GITHUB_TOKEN.trim()}`,
+    'User-Agent': 'Obsidian-Worker-Assistant',
+    Accept: 'application/vnd.github+json'
+  };
+}
+
+function githubRepoBase(env) {
+  return `https://api.github.com/repos/${env.GITHUB_OWNER.trim()}/${env.GITHUB_REPO.trim()}`;
+}
+
+async function readVaultFile(env, path) {
+  const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+  const res = await fetch(`${githubRepoBase(env)}/contents/${encodedPath}`, {
+    headers: await githubHeaders(env)
+  });
+  if (res.status === 404) return '';
+  const data = await readJsonSafe(res);
+  if (!res.ok || !data.content) {
+    throw taggedError('볼트 파일 읽기', `${path}: ${summarizeApiError(data, res.status)}`);
+  }
+  return decodeBase64Utf8(data.content.replace(/\n/g, ''));
+}
+
+async function listVaultNoteIndex(env) {
+  const res = await fetch(`${githubRepoBase(env)}/git/trees/HEAD?recursive=1`, {
+    headers: await githubHeaders(env)
+  });
+  const data = await readJsonSafe(res);
+  if (!res.ok) {
+    throw taggedError('볼트 목록 조회', summarizeApiError(data, res.status));
+  }
+
+  return (data.tree || [])
+    .filter((item) => item.type === 'blob' && item.path.endsWith('.md'))
+    .map((item) => item.path)
+    .filter((path) => !path.startsWith('.obsidian/') && !path.startsWith('Templates/') && path !== SKILL_PATH)
+    .map((path) => path.replace(/\.md$/, ''))
+    .slice(0, 300);
+}
+
+async function getGoogleAccessToken(env) {
+  requireEnv(env, ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN']);
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -198,11 +354,53 @@ async function createCalendarEvent(env, calendarEvent) {
   if (!tokenRes.ok || !tokenData.access_token) {
     throw taggedError('구글 토큰 갱신', summarizeApiError(tokenData, tokenRes.status));
   }
+  return tokenData.access_token;
+}
 
+async function listUpcomingCalendarEvents(env) {
+  if (!String(env.GOOGLE_REFRESH_TOKEN || '').trim()) {
+    return { items: [], error: 'GOOGLE_REFRESH_TOKEN 없음' };
+  }
+
+  const accessToken = await getGoogleAccessToken(env);
+  const now = new Date();
+  const timeMin = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+  const timeMax = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const url = new URL('https://www.googleapis.com/calendar/v3/calendars/primary/events');
+  url.searchParams.set('timeMin', timeMin);
+  url.searchParams.set('timeMax', timeMax);
+  url.searchParams.set('singleEvents', 'true');
+  url.searchParams.set('orderBy', 'startTime');
+  url.searchParams.set('maxResults', '30');
+
+  const calRes = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const calData = await readJsonSafe(calRes);
+  if (!calRes.ok) {
+    throw taggedError('구글 캘린더 조회', summarizeApiError(calData, calRes.status));
+  }
+
+  return {
+    items: (calData.items || []).map((item) => ({
+      summary: item.summary || '(제목 없음)',
+      start: item.start?.dateTime || item.start?.date || '',
+      end: item.end?.dateTime || item.end?.date || ''
+    }))
+  };
+}
+
+function formatCalendarForPrompt(items) {
+  if (!items.length) return '- (기간 내 일정 없음)';
+  return items.map((item) => `- ${item.start} ~ ${item.end} | ${item.summary}`).join('\n');
+}
+
+async function createCalendarEvent(env, calendarEvent) {
+  const accessToken = await getGoogleAccessToken(env);
   const calRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${tokenData.access_token}`,
+      Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
@@ -220,17 +418,13 @@ async function createCalendarEvent(env, calendarEvent) {
 }
 
 async function commitObsidianNote(env, note) {
-  requireEnv(env, ['GITHUB_OWNER', 'GITHUB_REPO', 'GITHUB_TOKEN']);
   const title = sanitizeFileName(note.title);
   const folder = sanitizeFileName(note.folder || 'Inbox');
   const path = `${folder}/${title}.md`;
   const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER.trim()}/${env.GITHUB_REPO.trim()}/contents/${encodedPath}`;
-
+  const url = `${githubRepoBase(env)}/contents/${encodedPath}`;
   const headers = {
-    Authorization: `Bearer ${env.GITHUB_TOKEN.trim()}`,
-    'User-Agent': 'Obsidian-Worker-Assistant',
-    Accept: 'application/vnd.github+json',
+    ...(await githubHeaders(env)),
     'Content-Type': 'application/json'
   };
 
@@ -296,13 +490,16 @@ function parseAiJson(raw) {
   }
 }
 
-function buildCompletionMessage(aiResult, results, steps) {
+function buildCompletionMessage(aiResult, results, steps, skill) {
   const failed = steps.filter((step) => !step.ok);
   const lines = [
     failed.length ? '⚠️ 처리 완료 (일부 실패)' : '✅ 완료',
     '',
+    `스킬: ${skill}`,
+    aiResult.calendarMatch ? `캘린더 매칭: ${aiResult.calendarMatch}` : '',
+    '',
     aiResult.replyMessage || '요청을 처리했습니다.'
-  ];
+  ].filter((line, idx, arr) => !(line === '' && arr[idx - 1] === ''));
 
   if (results.calendar) {
     lines.push('', `📅 구글 캘린더 등록 완료: ${results.calendar.summary}`);
@@ -310,7 +507,11 @@ function buildCompletionMessage(aiResult, results, steps) {
   }
 
   if (results.obsidian) {
-    lines.push(`📝 옵시디언 볼트 저장 완료: ${results.obsidian.path}`);
+    lines.push(`📝 옵시디언 저장 완료: ${results.obsidian.path}`);
+  }
+
+  if (skill === 'ask') {
+    lines.push('', '파일은 저장하지 않았습니다.');
   }
 
   if (failed.length) {
@@ -435,6 +636,13 @@ function arrayBufferToBase64(buffer) {
 
 function utf8ToBase64(text) {
   return arrayBufferToBase64(new TextEncoder().encode(text));
+}
+
+function decodeBase64Utf8(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
 }
 
 function truncate(text, max) {
