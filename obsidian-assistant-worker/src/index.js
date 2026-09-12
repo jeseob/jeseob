@@ -551,6 +551,40 @@ function cleanResearchQuery(query) {
     .slice(0, 200);
 }
 
+const RESEARCH_KO_EN = [
+  [/전고체\s*전지|전고체/g, 'all-solid-state battery'],
+  [/리튬\s*메탈|리튬메탈/g, 'lithium metal'],
+  [/고체\s*전해질|고체전해질/g, 'solid electrolyte'],
+  [/액체\s*전해질/g, 'liquid electrolyte'],
+  [/전해질/g, 'electrolyte'],
+  [/계면/g, 'interface'],
+  [/이차전지|배터리|전지/g, 'battery'],
+  [/양극|캐소드/g, 'cathode'],
+  [/음극|애노드/g, 'anode'],
+  [/분리막/g, 'separator'],
+  [/실리콘/g, 'silicon'],
+  [/흑연/g, 'graphite'],
+  [/황화물/g, 'sulfide'],
+  [/산화물/g, 'oxide'],
+  [/고분자/g, 'polymer'],
+  [/덴드라이트/g, 'dendrite']
+];
+
+function glossaryResearchQuery(query) {
+  let text = ` ${query} `;
+  for (const [pattern, english] of RESEARCH_KO_EN) {
+    text = text.replace(pattern, ` ${english} `);
+  }
+  const words = text
+    .replace(/[가-힣]+/g, ' ')
+    .replace(/[^a-zA-Z0-9+\- ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter((word) => word.length > 1);
+  return words.length >= 2 ? words.join(' ').slice(0, 200) : '';
+}
+
 async function toEnglishResearchQuery(env, query) {
   if (!/[가-힣]/.test(query)) return query;
 
@@ -565,8 +599,7 @@ async function toEnglishResearchQuery(env, query) {
           parts: [{
             text: `Convert this research topic into an English academic search query for OpenAlex. Use 6-12 words. No quotes, no explanation.\n\n${query}`
           }]
-        }],
-        generationConfig: { maxOutputTokens: 64 }
+        }]
       })
     }
   );
@@ -605,13 +638,17 @@ async function searchOpenAlex(env, query) {
   const cleaned = cleanResearchQuery(query);
   if (!cleaned) return { hits: [], query: '' };
 
-  const searches = [cleaned];
+  const searches = [];
+  const glossary = glossaryResearchQuery(cleaned);
+  if (glossary) searches.push(glossary);
   try {
     const english = await toEnglishResearchQuery(env, cleaned);
-    if (english && english !== cleaned) searches.unshift(english);
+    if (english && !searches.includes(english)) searches.push(english);
   } catch {
-    // 한글 질의 변환 실패 시 원문으로 검색
+    // 용어집 검색어로 진행
   }
+  if (!/[가-힣]/.test(cleaned) && !searches.includes(cleaned)) searches.push(cleaned);
+  if (!searches.length) return { hits: [], query: cleaned };
 
   for (const search of searches) {
     const hits = await fetchOpenAlexWorks(search);
@@ -891,6 +928,11 @@ function buildCompletionMessage(aiResult, results, steps, skill) {
 
   if (results.obsidian) {
     lines.push(`📝 옵시디언 저장 완료: ${results.obsidian.path}`);
+  }
+
+  const researchStep = steps.find((step) => step.name === '논문 검색');
+  if (researchStep) {
+    lines.push(`🔎 ${researchStep.detail}`);
   }
 
   if (skill === 'ask') {
