@@ -109,6 +109,11 @@ async function processAssistantTask(message, env) {
       return;
     }
 
+    if (isCasualChat(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
+      await notify(env, chatId, casualReply(textContent));
+      return;
+    }
+
     const youtubeUrl = linkedUrls.find(isYouTubeUrl);
     if (youtubeUrl) {
       const meta = await fetchYouTubeMeta(youtubeUrl);
@@ -173,7 +178,10 @@ async function processAssistantTask(message, env) {
       calendarEvents: calendarEvents.items || [],
       calendarError: calendarEvents.error || ''
     });
-    const skill = normalizeSkill(aiResult);
+    let skill = normalizeSkill(aiResult);
+    if (skill === 'memo' && isCasualChat(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
+      skill = 'chat';
+    }
     steps.push({ name: 'Gemini 분석', ok: true, detail: `skill=${skill}` });
 
     const results = { calendar: null, obsidian: null };
@@ -269,7 +277,7 @@ async function analyzeWithGemini(env, ctx) {
 
 아래 스킬 문서를 따른다. 스킬에 없는 일은 하지 않는다.
 ----- 스킬 -----
-${ctx.skillsDoc || '(스킬 파일 없음. memo/meeting/article/ask만 사용)'}
+${ctx.skillsDoc || '(스킬 파일 없음. memo/meeting/article/ask/chat만 사용)'}
 ----- 스킬 끝 -----
 
 해당 스킬 양식:
@@ -297,12 +305,13 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
 - youtube는 영상/메타에 있는 내용만. 없는 인용을 만들지 않는다.
 - paper는 연 초록/공개본만. 유료 본문을 추측하지 않는다.
 - research는 OpenAlex 검색 결과와 사용자가 준 링크만 출처로 쓴다. 없는 논문을 만들지 않는다.
-- ask는 obsidianNote를 넣지 말고 replyMessage로만 답한다. 관련 노트 본문에 있는 사실만 쓰고 [[경로]]로 근거를 밝힌다. 본문에 없으면 "볼트에 없음".
+- ask는 평소 질문이다. 볼트에 따로 묻지 않아도 된다. 파일을 저장하지 말고 replyMessage로만 답한다. 관련 노트 본문에 있는 사실만 쓰고 [[경로]]로 근거를 밝힌다. 본문에 없으면 "볼트에 없음".
+- chat는 인사·짧은 잡담·감탄·단순 응답(안녕, ㅇㅋ, 고마워, ㅋㅋ)이다. 파일을 만들지 말고 replyMessage로 한두 문장만 답한다. 사실·할 일·결정·링크·숫자가 있으면 chat이 아니다.
 - 노트 본문은 양식 섹션을 채워 마크다운으로 작성한다.
 
 반드시 JSON만 응답:
 {
-  "skill": "call" | "meeting" | "article" | "memo" | "ask" | "calendar.create" | "calendar.result" | "organize" | "paper" | "youtube" | "research" | "capture",
+  "skill": "call" | "meeting" | "article" | "memo" | "ask" | "chat" | "calendar.create" | "calendar.result" | "organize" | "paper" | "youtube" | "research" | "capture",
   "calendarMatch": "matched" | "unmatched" | "not_applicable",
   "calendarEvent": {
     "summary": "일정 명칭",
@@ -459,6 +468,7 @@ function guessSkillHint(ctx) {
   if (/논문 찾아|자료 찾아|조사해|리서치|찾아줘/.test(text)) return 'research';
   if (/arxiv\.org|doi\.org|10\.\d{4,}\/|논문/.test(text)) return 'paper';
   if (/Inbox 정리|인박스 정리/.test(text)) return 'organize';
+  if (isCasualChat(text, ctx.inlineImageData, ctx.inlineAudioData, extractHttpUrls(text))) return 'chat';
   if (shouldAskVault(text, ctx.inlineImageData, ctx.inlineAudioData, extractHttpUrls(text))) return 'ask';
   if (/기사|뉴스|https?:\/\//.test(text)) return 'article';
   if (/전화|통화/.test(text)) return 'call';
@@ -561,9 +571,44 @@ function normalizeSkill(aiResult) {
     calendar: 'calendar.create',
     both: 'calendar.create',
     obsidian: 'memo',
-    chat: 'ask'
+    chat: 'chat',
+    smalltalk: 'chat',
+    skip: 'chat',
+    ignore: 'chat'
   };
   return map[raw] || raw;
+}
+
+function normalizeCasualText(text) {
+  return String(text || '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[.。…·~～!！?？,，、;；:：'"“”‘’()[\]{}<>]/g, ' ')
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const CASUAL_PHRASE = /^(?:안녕(?:하세요|히\s*가세요)?|하이+|헬로+|헬로우+|hello+|hey+|hi+|ㅎㅇ+|좋은\s*(?:아침|점심|저녁)|잘\s*자(?:요)?|굿\s*나잇|good\s*night|바이+|bye+|수고(?:했어(?:요)?|하세요)?|고마워(?:요)?|고맙습니다|감사합니다|땡큐+|thanks?(?:\s*you)?|ㅇㅋ+|오케이|ok+|okay|응+|어+|네+|넵+|음+|알겠어(?:요)?|알겠습니다|그래(?:요)?|좋아(?:요)?|굿+|ㅋㅋ+|ㅎㅎ+|하하+)$/i;
+
+function isCasualChat(text, image, audio, urls) {
+  if (image || audio) return false;
+  if ((urls || []).length) return false;
+  const raw = String(text || '').trim();
+  if (!raw) return true;
+  if (/정리해|저장해|올려줘|스크랩|일정|회의|미팅|전화|논문|리서치|기사/.test(raw)) return false;
+  const normalized = normalizeCasualText(raw);
+  if (!normalized) return true;
+  if (CASUAL_PHRASE.test(normalized)) return true;
+  const tokens = normalized.split(' ').filter(Boolean);
+  return tokens.length > 0 && tokens.every((token) => CASUAL_PHRASE.test(token));
+}
+
+function casualReply(text) {
+  const normalized = normalizeCasualText(text);
+  if (/고마|감사|thank|땡큐/i.test(normalized)) return '네.';
+  if (/잘\s*자|굿\s*나잇|good\s*night/i.test(normalized)) return '네, 편히 쉬세요.';
+  if (/안녕|하이|헬로|hello|hi|hey|ㅎㅇ|좋은/i.test(normalized)) return '안녕하세요.';
+  return '네.';
 }
 
 function applySkillDefaults(skill, note) {
@@ -769,6 +814,10 @@ function parseAiJson(raw) {
 }
 
 function buildCompletionMessage(aiResult, results, steps, skill) {
+  if (skill === 'chat') {
+    return aiResult.replyMessage || '네.';
+  }
+
   const failed = steps.filter((step) => !step.ok);
   const lines = [
     failed.length ? '⚠️ 처리 완료 (일부 실패)' : '✅ 완료',
