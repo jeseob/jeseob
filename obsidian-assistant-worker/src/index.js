@@ -79,6 +79,11 @@ async function processAssistantTask(message, env) {
       steps.push({ name: '음성 수신', ok: true, detail: inlineAudioData.mimeType });
     }
 
+    const linkedUrls = extractUrlsFromMessage(message);
+    if (linkedUrls.length && !linkedUrls.some((url) => textContent.includes(url))) {
+      textContent = `${textContent}\n${linkedUrls.join('\n')}`.trim();
+    }
+
     if (!textContent && !inlineAudioData) {
       await notify(env, chatId, '⚠️ 처리할 텍스트나 음성이 없습니다.');
       return;
@@ -86,10 +91,10 @@ async function processAssistantTask(message, env) {
 
     const pageTexts = await fetchLinkedPages(textContent);
     if (pageTexts.length) {
-      steps.push({ name: '기사 URL 수집', ok: true, detail: `${pageTexts.length}건` });
+      steps.push({ name: '기사 URL 수집', ok: true, detail: linkedUrls.join(', ') || `${pageTexts.length}건` });
       textContent = `${textContent}\n\n----- 가져온 원문 -----\n${pageTexts.join('\n\n')}`;
-    } else if (extractHttpUrls(textContent).length) {
-      steps.push({ name: '기사 URL 수집', ok: false, detail: 'URL은 있으나 본문을 열지 못함' });
+    } else if (linkedUrls.length) {
+      steps.push({ name: '기사 URL 수집', ok: false, detail: `열기 실패: ${linkedUrls.join(', ')}` });
     }
 
     const needCalendar = shouldLookupCalendar(textContent, inlineAudioData);
@@ -284,6 +289,30 @@ function shouldLookupCalendar(textContent, inlineAudioData) {
   const text = String(textContent || '');
   if (inlineAudioData) return true;
   return /회의|미팅|일정|캘린더|결과 정리/.test(text);
+}
+
+function extractUrlsFromMessage(message) {
+  const texts = [message.text, message.caption].filter(Boolean);
+  const urls = [];
+  for (const text of texts) urls.push(...extractHttpUrls(text));
+
+  const entityGroups = [
+    [message.text || '', message.entities || []],
+    [message.caption || '', message.caption_entities || []]
+  ];
+  for (const [text, entities] of entityGroups) {
+    for (const entity of entities) {
+      if (entity.type === 'text_link' && entity.url) urls.push(entity.url);
+      if (entity.type === 'url' && text) {
+        urls.push(sliceTelegramText(text, entity.offset, entity.length));
+      }
+    }
+  }
+  return [...new Set(urls.map((url) => url.replace(/[),.;]+$/, '')).filter((url) => /^https?:\/\//i.test(url)))];
+}
+
+function sliceTelegramText(text, offset, length) {
+  return [...text].slice(offset, offset + length).join('');
 }
 
 function extractHttpUrls(text) {
