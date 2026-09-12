@@ -551,38 +551,26 @@ function cleanResearchQuery(query) {
     .slice(0, 200);
 }
 
-const RESEARCH_KO_EN = [
-  [/전고체\s*전지|전고체/g, 'all-solid-state battery'],
-  [/리튬\s*메탈|리튬메탈/g, 'lithium metal'],
-  [/고체\s*전해질|고체전해질/g, 'solid electrolyte'],
-  [/액체\s*전해질/g, 'liquid electrolyte'],
-  [/전해질/g, 'electrolyte'],
-  [/계면/g, 'interface'],
-  [/이차전지|배터리|전지/g, 'battery'],
-  [/양극|캐소드/g, 'cathode'],
-  [/음극|애노드/g, 'anode'],
-  [/분리막/g, 'separator'],
-  [/실리콘/g, 'silicon'],
-  [/흑연/g, 'graphite'],
-  [/황화물/g, 'sulfide'],
-  [/산화물/g, 'oxide'],
-  [/고분자/g, 'polymer'],
-  [/덴드라이트/g, 'dendrite']
-];
-
-function glossaryResearchQuery(query) {
-  let text = ` ${query} `;
-  for (const [pattern, english] of RESEARCH_KO_EN) {
-    text = text.replace(pattern, ` ${english} `);
-  }
-  const words = text
-    .replace(/[가-힣]+/g, ' ')
-    .replace(/[^a-zA-Z0-9+\- ]/g, ' ')
+function sanitizeEnglishQuery(text) {
+  const cleaned = String(text || '')
+    .replace(/MYMEMORY WARNING:.*/i, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&quot;|&#39;|&amp;|["'`]/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter((word) => word.length > 1);
-  return words.length >= 2 ? words.join(' ').slice(0, 200) : '';
+    .trim();
+  if (!cleaned || /[가-힣]/.test(cleaned)) return '';
+  return cleaned.slice(0, 200);
+}
+
+async function translateResearchQuery(query) {
+  if (!/[가-힣]/.test(query)) return query;
+
+  const url = new URL('https://api.mymemory.translated.net/get');
+  url.searchParams.set('q', query.slice(0, 500));
+  url.searchParams.set('langpair', 'ko|en');
+  const res = await fetch(url, { headers: { 'User-Agent': 'ObsidianAssistant/1.0' } });
+  const data = await readJsonSafe(res);
+  return sanitizeEnglishQuery(data?.responseData?.translatedText);
 }
 
 async function toEnglishResearchQuery(env, query) {
@@ -607,9 +595,7 @@ async function toEnglishResearchQuery(env, query) {
   if (!res.ok) return '';
 
   try {
-    const text = extractGeminiText(data).replace(/["'`]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (!text || /[가-힣]/.test(text)) return '';
-    return text.slice(0, 200);
+    return sanitizeEnglishQuery(extractGeminiText(data));
   } catch {
     return '';
   }
@@ -639,13 +625,17 @@ async function searchOpenAlex(env, query) {
   if (!cleaned) return { hits: [], query: '' };
 
   const searches = [];
-  const glossary = glossaryResearchQuery(cleaned);
-  if (glossary) searches.push(glossary);
+  try {
+    const translated = await translateResearchQuery(cleaned);
+    if (translated) searches.push(translated);
+  } catch {
+    // Gemini 변환으로 진행
+  }
   try {
     const english = await toEnglishResearchQuery(env, cleaned);
     if (english && !searches.includes(english)) searches.push(english);
   } catch {
-    // 용어집 검색어로 진행
+    // 번역 검색어로 진행
   }
   if (!/[가-힣]/.test(cleaned) && !searches.includes(cleaned)) searches.push(cleaned);
   if (!searches.length) return { hits: [], query: cleaned };
