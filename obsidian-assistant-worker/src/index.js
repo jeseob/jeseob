@@ -3,7 +3,7 @@
  *
  * 규칙 파일(볼트):
  *   _system/skills.md
- *   Templates/{article,meeting,call,inbox-memo,calendar-event,calendar-result}.md
+ *   Templates/{article,meeting,call,inbox-memo,calendar-event,calendar-result,paper,youtube,research,capture}.md
  */
 
 const GEMINI_MODEL = 'gemini-3.6-flash';
@@ -17,7 +17,11 @@ const TEMPLATE_BY_SKILL = {
   memo: 'Templates/inbox-memo.md',
   'calendar.create': 'Templates/calendar-event.md',
   'calendar.result': 'Templates/calendar-result.md',
-  organize: 'Templates/inbox-memo.md'
+  organize: 'Templates/inbox-memo.md',
+  paper: 'Templates/paper.md',
+  youtube: 'Templates/youtube.md',
+  research: 'Templates/research.md',
+  capture: 'Templates/capture.md'
 };
 const FOLDER_BY_SKILL = {
   call: 'Calls',
@@ -26,7 +30,11 @@ const FOLDER_BY_SKILL = {
   memo: 'Inbox',
   'calendar.create': 'Calendar',
   'calendar.result': 'Calendar',
-  organize: 'Inbox'
+  organize: 'Inbox',
+  paper: 'Papers',
+  youtube: 'Videos',
+  research: 'Research',
+  capture: 'Captures'
 };
 const SAVE_SKILLS = new Set([
   'call',
@@ -35,7 +43,11 @@ const SAVE_SKILLS = new Set([
   'memo',
   'calendar.create',
   'calendar.result',
-  'organize'
+  'organize',
+  'paper',
+  'youtube',
+  'research',
+  'capture'
 ]);
 
 export default {
@@ -68,6 +80,7 @@ async function processAssistantTask(message, env) {
   const chatId = message.chat.id;
   let textContent = message.text || message.caption || '';
   let inlineAudioData = null;
+  let inlineImageData = null;
   const steps = [];
 
   try {
@@ -79,22 +92,50 @@ async function processAssistantTask(message, env) {
       steps.push({ name: '음성 수신', ok: true, detail: inlineAudioData.mimeType });
     }
 
+    const photo = pickTelegramPhoto(message);
+    if (photo) {
+      await notify(env, chatId, '🖼️ 스크린샷을 수신했습니다. 화면에 보이는 글자만 정리합니다...');
+      inlineImageData = await downloadTelegramFile(env, photo.file_id, photo.mimeType || 'image/jpeg');
+      steps.push({ name: '이미지 수신', ok: true, detail: inlineImageData.mimeType });
+    }
+
     const linkedUrls = extractUrlsFromMessage(message);
     if (linkedUrls.length && !linkedUrls.some((url) => textContent.includes(url))) {
       textContent = `${textContent}\n${linkedUrls.join('\n')}`.trim();
     }
 
-    if (!textContent && !inlineAudioData) {
-      await notify(env, chatId, '⚠️ 처리할 텍스트나 음성이 없습니다.');
+    if (!textContent && !inlineAudioData && !inlineImageData) {
+      await notify(env, chatId, '⚠️ 처리할 텍스트, 음성, 사진이 없습니다.');
       return;
     }
 
-    const pageTexts = await fetchLinkedPages(textContent);
+    const youtubeUrl = linkedUrls.find(isYouTubeUrl);
+    if (youtubeUrl) {
+      const meta = await fetchYouTubeMeta(youtubeUrl);
+      steps.push({ name: '유튜브 정보', ok: true, detail: meta.title || youtubeUrl });
+      textContent = `${textContent}\n\n----- 유튜브 -----\n${meta.summary}`;
+    }
+
+    const pageUrls = linkedUrls.filter((url) => !isYouTubeUrl(url));
+    const pageTexts = await fetchLinkedPages(pageUrls.join('\n'));
     if (pageTexts.length) {
-      steps.push({ name: '기사 URL 수집', ok: true, detail: linkedUrls.join(', ') || `${pageTexts.length}건` });
+      steps.push({ name: 'URL 수집', ok: true, detail: `${pageTexts.length}건` });
       textContent = `${textContent}\n\n----- 가져온 원문 -----\n${pageTexts.join('\n\n')}`;
-    } else if (linkedUrls.length) {
-      steps.push({ name: '기사 URL 수집', ok: false, detail: `열기 실패: ${linkedUrls.join(', ')}` });
+    } else if (pageUrls.length) {
+      steps.push({ name: 'URL 수집', ok: false, detail: `열기 실패: ${pageUrls.join(', ')}` });
+    }
+
+    let researchHits = [];
+    if (shouldRunResearch(textContent, inlineImageData, inlineAudioData, linkedUrls)) {
+      researchHits = await searchOpenAlex(textContent);
+      steps.push({
+        name: '논문 검색',
+        ok: true,
+        detail: researchHits.length ? `${researchHits.length}건` : '검색 결과 없음'
+      });
+      if (researchHits.length) {
+        textContent = `${textContent}\n\n----- OpenAlex 검색 결과 -----\n${researchHits.join('\n')}`;
+      }
     }
 
     const needCalendar = shouldLookupCalendar(textContent, inlineAudioData);
@@ -118,6 +159,8 @@ async function processAssistantTask(message, env) {
     const aiResult = await analyzeWithGemini(env, {
       textContent,
       inlineAudioData,
+      inlineImageData,
+      youtubeUrl,
       skillsDoc,
       noteIndex,
       calendarEvents: calendarEvents.items || [],
@@ -161,35 +204,51 @@ function requireEnv(env, keys) {
 }
 
 async function downloadTelegramAudio(env, targetAudio) {
+  return downloadTelegramFile(env, targetAudio.file_id, targetAudio.mime_type || 'audio/ogg');
+}
+
+async function downloadTelegramFile(env, fileId, mimeType) {
   const token = env.TELEGRAM_BOT_TOKEN.trim();
   const fileRes = await fetch(
-    `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(targetAudio.file_id)}`
+    `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`
   );
   const fileData = await readJsonSafe(fileRes);
   if (!fileRes.ok || !fileData.ok || !fileData.result?.file_path) {
-    throw taggedError('음성 파일 조회', summarizeApiError(fileData, fileRes.status));
+    throw taggedError('텔레그램 파일 조회', summarizeApiError(fileData, fileRes.status));
   }
 
-  const audioRes = await fetch(
+  const fileFetch = await fetch(
     `https://api.telegram.org/file/bot${token}/${fileData.result.file_path}`
   );
-  if (!audioRes.ok) {
-    throw taggedError('음성 다운로드', `HTTP ${audioRes.status} ${audioRes.statusText}`);
+  if (!fileFetch.ok) {
+    throw taggedError('텔레그램 파일 다운로드', `HTTP ${fileFetch.status} ${fileFetch.statusText}`);
   }
 
-  const buffer = await audioRes.arrayBuffer();
+  const buffer = await fileFetch.arrayBuffer();
   if (!buffer.byteLength) {
-    throw taggedError('음성 다운로드', '받은 오디오 데이터가 비어 있습니다.');
+    throw taggedError('텔레그램 파일 다운로드', '받은 데이터가 비어 있습니다.');
   }
 
   return {
-    mimeType: targetAudio.mime_type || 'audio/ogg',
+    mimeType,
     data: arrayBufferToBase64(buffer)
   };
 }
 
+function pickTelegramPhoto(message) {
+  if (Array.isArray(message.photo) && message.photo.length) {
+    const largest = message.photo[message.photo.length - 1];
+    return { file_id: largest.file_id, mimeType: 'image/jpeg' };
+  }
+  const doc = message.document;
+  if (doc?.mime_type?.startsWith('image/')) {
+    return { file_id: doc.file_id, mimeType: doc.mime_type };
+  }
+  return null;
+}
+
 async function analyzeWithGemini(env, ctx) {
-  const skill = guessSkillHint(ctx.textContent, ctx.inlineAudioData);
+  const skill = guessSkillHint(ctx);
   const templatePaths = skill
     ? [TEMPLATE_BY_SKILL[skill] || TEMPLATE_BY_SKILL.memo]
     : [TEMPLATE_BY_SKILL.call, TEMPLATE_BY_SKILL.meeting];
@@ -224,12 +283,16 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
 - meeting은 캘린더와 시간/제목을 맞춘다. 맞으면 calendarMatch=matched, 없으면 unmatched.
 - [[링크]]는 위 목록에 있는 제목만. 없는 노트를 만들지 않는다.
 - 입력·볼트·캘린더에 없는 사실/숫자/인용/피드백/결정을 만들지 않는다. 불확실하면 [확인 필요].
+- capture는 이미지에 보이는 글자만 적는다. 카카오톡/문자 추정은 화면 단서로만.
+- youtube는 영상/메타에 있는 내용만. 없는 인용을 만들지 않는다.
+- paper는 연 초록/공개본만. 유료 본문을 추측하지 않는다.
+- research는 OpenAlex 검색 결과와 사용자가 준 링크만 출처로 쓴다. 없는 논문을 만들지 않는다.
 - ask는 obsidianNote를 넣지 말고 replyMessage로만 답한다. 볼트에 없으면 "볼트에 없음".
 - 노트 본문은 양식 섹션을 채워 마크다운으로 작성한다.
 
 반드시 JSON만 응답:
 {
-  "skill": "call" | "meeting" | "article" | "memo" | "ask" | "calendar.create" | "calendar.result" | "organize",
+  "skill": "call" | "meeting" | "article" | "memo" | "ask" | "calendar.create" | "calendar.result" | "organize" | "paper" | "youtube" | "research" | "capture",
   "calendarMatch": "matched" | "unmatched" | "not_applicable",
   "calendarEvent": {
     "summary": "일정 명칭",
@@ -238,16 +301,18 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
   },
   "obsidianNote": {
     "title": "노트 파일명 (간결하게, 확장자 없음)",
-    "folder": "Inbox | Calls | Meetings | Calendar",
+    "folder": "Inbox | Calls | Meetings | Calendar | Papers | Videos | Research | Captures",
     "content": "양식을 채운 마크다운"
   },
   "replyMessage": "사용자에게 보낼 짧은 안내"
 }`;
 
   const userText = [
-    ctx.textContent || (ctx.inlineAudioData
-      ? '이 음성이 전화인지 회의인지 구분해 해당 스킬과 양식으로 정리해 줘.'
-      : ''),
+    ctx.textContent || (ctx.inlineImageData
+      ? '이 스크린샷에 보이는 글자만 읽어 capture 양식으로 정리해 줘. 안 보이면 [확인 필요].'
+      : ctx.inlineAudioData
+        ? '이 음성이 전화인지 회의인지 구분해 해당 스킬과 양식으로 정리해 줘.'
+        : ''),
     skill ? `\n힌트 스킬: ${skill}` : ''
   ].join('');
 
@@ -255,7 +320,9 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
     contents: [{
       role: 'user',
       parts: [
+        ...(ctx.inlineImageData ? [{ inlineData: ctx.inlineImageData }] : []),
         ...(ctx.inlineAudioData ? [{ inlineData: ctx.inlineAudioData }] : []),
+        ...(ctx.youtubeUrl ? [{ fileData: { fileUri: ctx.youtubeUrl, mimeType: 'video/mp4' } }] : []),
         { text: userText }
       ]
     }],
@@ -263,7 +330,7 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
     generationConfig: { responseMimeType: 'application/json' }
   };
 
-  const geminiRes = await fetch(
+  let geminiRes = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${env.GEMINI_API_KEY.trim()}`,
     {
       method: 'POST',
@@ -272,7 +339,19 @@ ${ctx.calendarError ? `조회 실패: ${ctx.calendarError}` : formatCalendarForP
     }
   );
 
-  const geminiData = await readJsonSafe(geminiRes);
+  let geminiData = await readJsonSafe(geminiRes);
+  if (!geminiRes.ok && ctx.youtubeUrl) {
+    geminiPayload.contents[0].parts = geminiPayload.contents[0].parts.filter((part) => !part.fileData);
+    geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${env.GEMINI_API_KEY.trim()}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(geminiPayload)
+      }
+    );
+    geminiData = await readJsonSafe(geminiRes);
+  }
   if (!geminiRes.ok) {
     throw taggedError('Gemini 호출', summarizeApiError(geminiData, geminiRes.status));
   }
@@ -361,16 +440,70 @@ function htmlToText(html) {
     .slice(0, 12000);
 }
 
-function guessSkillHint(textContent, inlineAudioData) {
-  const text = String(textContent || '');
+function guessSkillHint(ctx) {
+  const text = String(ctx.textContent || '');
+  if (ctx.inlineImageData) return 'capture';
+  if (ctx.youtubeUrl || isYouTubeUrl(text)) return 'youtube';
   if (/일정\s*잡아|캘린더.*등록|미팅 잡아/.test(text)) return 'calendar.create';
   if (/결과 정리|일정 결과/.test(text)) return 'calendar.result';
-  if (/\?|뭐야|요약해|관련.*뭐|찾아/.test(text) && !inlineAudioData) return 'ask';
+  if (/논문 찾아|자료 찾아|조사해|리서치|찾아줘/.test(text)) return 'research';
+  if (/arxiv\.org|doi\.org|10\.\d{4,}\/|논문/.test(text)) return 'paper';
   if (/Inbox 정리|인박스 정리/.test(text)) return 'organize';
-  if (/기사|뉴스|http/.test(text)) return 'article';
+  if (/\?|뭐야|관련.*뭐/.test(text) && !ctx.inlineAudioData) return 'ask';
+  if (/기사|뉴스|https?:\/\//.test(text)) return 'article';
   if (/전화|통화/.test(text)) return 'call';
-  if (/회의|미팅/.test(text) || inlineAudioData) return '';
+  if (/회의|미팅/.test(text) || ctx.inlineAudioData) return '';
   return 'memo';
+}
+
+function shouldRunResearch(text, image, audio, urls) {
+  if (image || audio) return false;
+  if (urls.some(isYouTubeUrl)) return false;
+  return /논문 찾아|자료 찾아|조사해|리서치|찾아줘/.test(String(text || ''));
+}
+
+function isYouTubeUrl(value) {
+  return /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)/i.test(String(value || ''));
+}
+
+async function fetchYouTubeMeta(url) {
+  try {
+    const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
+    if (!res.ok) return { title: '', summary: `URL: ${url}\n메타 조회 실패 HTTP ${res.status}` };
+    const data = await readJsonSafe(res);
+    return {
+      title: data.title || '',
+      summary: `URL: ${url}\n제목: ${data.title || ''}\n채널: ${data.author_name || ''}`
+    };
+  } catch (err) {
+    return { title: '', summary: `URL: ${url}\n메타 조회 실패: ${err.message}` };
+  }
+}
+
+async function searchOpenAlex(query) {
+  const cleaned = String(query || '')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/논문 찾아|자료 찾아|조사해|리서치|찾아줘|기사 정리/g, ' ')
+    .trim()
+    .slice(0, 200);
+  if (!cleaned) return [];
+
+  const url = new URL('https://api.openalex.org/works');
+  url.searchParams.set('search', cleaned);
+  url.searchParams.set('per-page', '5');
+  url.searchParams.set('sort', 'relevance_score:desc');
+
+  const res = await fetch(url, { headers: { 'User-Agent': 'ObsidianAssistant/1.0' } });
+  const data = await readJsonSafe(res);
+  if (!res.ok || !Array.isArray(data.results)) return [];
+
+  return data.results.map((work) => {
+    const authors = (work.authorships || []).slice(0, 4).map((a) => a.author?.display_name).filter(Boolean).join(', ');
+    const year = work.publication_year || '';
+    const doi = work.doi || '';
+    const landing = work.primary_location?.landing_page_url || work.id || '';
+    return `- ${work.display_name || '(제목 없음)'} / ${authors} / ${year} / ${doi || landing}`;
+  });
 }
 
 function normalizeSkill(aiResult) {
