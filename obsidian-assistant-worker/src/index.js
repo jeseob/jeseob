@@ -138,11 +138,11 @@ async function processAssistantTask(message, env) {
         name: '논문 검색',
         ok: true,
         detail: researchHits.length
-          ? `${researchHits.length}건 (${research.query})`
-          : `검색 결과 없음 (${research.query || '질의 없음'})`
+          ? `${researchHits.length}건 · ${research.source} · ${research.query}`
+          : `검색 결과 없음 (${research.query || '질의 없음'})${research.error ? ` · ${research.error}` : ''}`
       });
       if (researchHits.length) {
-        textContent = `${textContent}\n\n----- OpenAlex 검색 결과 -----\n검색어: ${research.query}\n${researchHits.join('\n')}`;
+        textContent = `${textContent}\n\n----- ${research.source} 검색 결과 -----\n검색어: ${research.query}\n${researchHits.join('\n')}`;
       }
     }
 
@@ -601,28 +601,73 @@ async function toEnglishResearchQuery(env, query) {
   }
 }
 
+function formatPaperHit(title, authors, year, id) {
+  return `- ${title || '(제목 없음)'} / ${authors || ''} / ${year || ''} / ${id || ''}`.replace(/ \/  \/ /g, ' / ');
+}
+
 async function fetchOpenAlexWorks(query) {
   const url = new URL('https://api.openalex.org/works');
   url.searchParams.set('search', query);
   url.searchParams.set('per-page', '5');
-  url.searchParams.set('sort', 'relevance_score:desc');
 
-  const res = await fetch(url, { headers: { 'User-Agent': 'ObsidianAssistant/1.0' } });
-  const data = await readJsonSafe(res);
-  if (!res.ok || !Array.isArray(data.results)) return [];
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'ObsidianAssistant/1.0 (https://github.com/jeseob/jeseob)' }
+    });
+    const data = await readJsonSafe(res);
+    if (!res.ok) {
+      return { hits: [], error: `OpenAlex HTTP ${res.status}` };
+    }
+    if (!Array.isArray(data.results)) {
+      return { hits: [], error: 'OpenAlex 응답 형식 오류' };
+    }
+    return {
+      hits: data.results.map((work) => {
+        const authors = (work.authorships || []).slice(0, 4).map((a) => a.author?.display_name).filter(Boolean).join(', ');
+        const year = work.publication_year || '';
+        const doi = work.doi || '';
+        const landing = work.primary_location?.landing_page_url || work.id || '';
+        return formatPaperHit(work.display_name, authors, year, doi || landing);
+      }),
+      error: ''
+    };
+  } catch (err) {
+    return { hits: [], error: `OpenAlex 호출 실패: ${err.message}` };
+  }
+}
 
-  return data.results.map((work) => {
-    const authors = (work.authorships || []).slice(0, 4).map((a) => a.author?.display_name).filter(Boolean).join(', ');
-    const year = work.publication_year || '';
-    const doi = work.doi || '';
-    const landing = work.primary_location?.landing_page_url || work.id || '';
-    return `- ${work.display_name || '(제목 없음)'} / ${authors} / ${year} / ${doi || landing}`;
-  });
+async function fetchCrossrefWorks(query) {
+  const url = new URL('https://api.crossref.org/works');
+  url.searchParams.set('query', query);
+  url.searchParams.set('rows', '5');
+
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'ObsidianAssistant/1.0 (https://github.com/jeseob/jeseob)' }
+    });
+    const data = await readJsonSafe(res);
+    const items = data?.message?.items;
+    if (!res.ok || !Array.isArray(items)) {
+      return { hits: [], error: `Crossref HTTP ${res.status}` };
+    }
+    return {
+      hits: items.map((item) => {
+        const title = Array.isArray(item.title) ? item.title[0] : item.title;
+        const authors = (item.author || []).slice(0, 4).map((a) => [a.given, a.family].filter(Boolean).join(' ')).join(', ');
+        const year = item.issued?.['date-parts']?.[0]?.[0] || '';
+        const doi = item.DOI ? `https://doi.org/${item.DOI}` : '';
+        return formatPaperHit(title, authors, year, doi);
+      }),
+      error: ''
+    };
+  } catch (err) {
+    return { hits: [], error: `Crossref 호출 실패: ${err.message}` };
+  }
 }
 
 async function searchOpenAlex(env, query) {
   const cleaned = cleanResearchQuery(query);
-  if (!cleaned) return { hits: [], query: '' };
+  if (!cleaned) return { hits: [], query: '', source: '', error: '' };
 
   const searches = [];
   try {
@@ -638,14 +683,20 @@ async function searchOpenAlex(env, query) {
     // 번역 검색어로 진행
   }
   if (!/[가-힣]/.test(cleaned) && !searches.includes(cleaned)) searches.push(cleaned);
-  if (!searches.length) return { hits: [], query: cleaned };
+  if (!searches.length) return { hits: [], query: cleaned, source: '', error: '영문 검색어 없음' };
 
+  const errors = [];
   for (const search of searches) {
-    const hits = await fetchOpenAlexWorks(search);
-    if (hits.length) return { hits, query: search };
+    const openalex = await fetchOpenAlexWorks(search);
+    if (openalex.hits.length) return { hits: openalex.hits, query: search, source: 'OpenAlex', error: '' };
+    if (openalex.error) errors.push(openalex.error);
+
+    const crossref = await fetchCrossrefWorks(search);
+    if (crossref.hits.length) return { hits: crossref.hits, query: search, source: 'Crossref', error: '' };
+    if (crossref.error) errors.push(crossref.error);
   }
 
-  return { hits: [], query: searches[0] };
+  return { hits: [], query: searches[0], source: '', error: errors[0] || '' };
 }
 
 function normalizeSkill(aiResult) {
